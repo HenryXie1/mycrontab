@@ -16,33 +16,83 @@ limitations under the License.
 package controllers
 
 import (
-	"context"
+    "context"
+    "fmt"
+    "sort"
+    "time"
 
-	"github.com/go-logr/logr"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+    "github.com/go-logr/logr"
+    "github.com/robfig/cron"
+    kbatch "k8s.io/api/batch/v1"
+    corev1 "k8s.io/api/core/v1"
+    apierrs "k8s.io/apimachinery/pkg/api/errors"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/runtime"
+    ref "k8s.io/client-go/tools/reference"
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/client"
 
-	batchv1 "mycrontab/api/v1"
+    batch "mycrontab/api/v1"
 )
 
 // CronJobReconciler reconciles a CronJob object
 type CronJobReconciler struct {
-	client.Client
-	Log logr.Logger
+    client.Client
+    Log    logr.Logger
+    Scheme *runtime.Scheme
+    Clock
 }
 
-// +kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=batch.tutorial.kubebuilder.io,resources=cronjobs/status,verbs=get;update;patch
+
+type realClock struct{}
+
+func (_ realClock) Now() time.Time { return time.Now() }
+
+// clock knows how to get the current time.
+// It can be used to fake out timing for testing.
+type Clock interface {
+    Now() time.Time
+}
+
+
+func ignoreNotFound(err error) error {
+    if apierrs.IsNotFound(err) {
+        return nil
+    }
+    return err
+}
+
+// +kubebuilder:rbac:groups=batch.mycrontab,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch.mycrontab,resources=cronjobs/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
+
+var (
+    scheduledTimeAnnotation = "batch.mycrontab/scheduled-at"
+)
 
 func (r *CronJobReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	_ = context.Background()
-	_ = r.Log.WithValues("cronjob", req.NamespacedName)
+    ctx := context.Background()
+    log := r.Log.WithValues("cronjob", req.NamespacedName)
 
-	// your logic here
 
-	return ctrl.Result{}, nil
+	var cronJob batch.CronJob
+	
+    if err := r.Get(ctx, req.NamespacedName, &cronJob); err != nil {
+        log.Error(err, "unable to fetch CronJob")
+        // we'll ignore not-found errors, since they can't be fixed by an immediate
+        // requeue (we'll need to wait for a new notification), and we can get them
+        // on deleted requests.
+        return ctrl.Result{}, ignoreNotFound(err)
+	}
+
+    var childJobs kbatch.JobList
+    if err := r.List(ctx, &childJobs, client.InNamespace(req.Namespace), client.MatchingField(jobOwnerKey, req.Name)); err != nil {
+        log.Error(err, "unable to list child Jobs")
+        return ctrl.Result{}, err
+    }
+
 }
-
 func (r *CronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&batchv1.CronJob{}).
